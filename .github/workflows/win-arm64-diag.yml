@@ -73,6 +73,7 @@ jobs:
         run: cargo test -p openssl --lib -- --test-threads=1 --nocapture
       - name: one process per test
         continue-on-error: true
+        working-directory: openssl
         run: |
           $tests = & $env:TEST_EXE --list --format terse | Where-Object { $_ -match ': test$' } | ForEach-Object { $_ -replace ': test$', '' }
           Write-Output "tests: $($tests.Count)"
@@ -81,14 +82,15 @@ jobs:
             & $env:TEST_EXE --exact $t --test-threads=1 *> $null
             if ($LASTEXITCODE -ne 0) {
               Write-Output ("FAILED {0} exit=0x{1:x8}" -f $t, $LASTEXITCODE)
-              $failed += $t
+              if ($LASTEXITCODE -eq -1073741819) { $failed += $t }
             }
           }
           Write-Output "failed count: $($failed.Count)"
           $failed -join "`n" | Out-File -Encoding ascii "$env:RUNNER_TEMP\failed.txt"
           if ($failed.Count -ne 0) { exit 1 }
-      - name: debugger stacks for failing tests
+      - name: debugger stacks for crashing tests
         if: always()
+        working-directory: openssl
         run: |
           $list = "$env:RUNNER_TEMP\failed.txt"
           if (!(Test-Path $list)) { exit 0 }
@@ -102,7 +104,7 @@ jobs:
           g
           q
           "@ | Out-File -Encoding ascii $script
-          foreach ($t in (Get-Content $list | Select-Object -First 5)) {
+          foreach ($t in (Get-Content $list | Select-Object -First 3)) {
             if (!$t) { continue }
             Write-Output "##### $t"
             $out = & $cdb -lines -cf $script $env:TEST_EXE --exact $t --test-threads=1 2>&1
@@ -110,3 +112,8 @@ jobs:
             Write-Output "debugger output lines: $n"
             if ($n -le 400) { $out } else { $out | Select-Object -First 250; Write-Output '...'; $out | Select-Object -Last 120 }
           }
+      - name: full CI test commands
+        run: |
+          cargo test -p openssl
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test -p openssl-errors
