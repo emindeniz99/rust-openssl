@@ -1,0 +1,112 @@
+name: win-arm64-diag
+
+# Temporary diagnosis workflow for the windows-vcpkg-arm64 access violation.
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - ci-windows-arm64-diagnose
+
+env:
+  RUSTFLAGS: -Dwarnings
+  RUST_BACKTRACE: 1
+
+permissions:
+  contents: read
+
+jobs:
+  diag:
+    strategy:
+      fail-fast: false
+      matrix:
+        toolset:
+          - default
+          - "14.44"
+    name: diag-arm64-msvc-${{ matrix.toolset }}
+    runs-on: windows-11-arm
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: sfackler/actions/rustup@55af96fecc6b2ff28431120e3d9b723e5c1bccbf # master
+      - run: echo "VCPKG_ROOT=$env:VCPKG_INSTALLATION_ROOT" | Out-File -FilePath $env:GITHUB_ENV -Append
+      - name: environment info
+        run: |
+          rustc -vV
+          git -C $env:VCPKG_INSTALLATION_ROOT log -1 --format='%H %cd'
+          Get-Content "$env:VCPKG_INSTALLATION_ROOT\ports\openssl\vcpkg.json"
+          Get-ChildItem 'C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC' | Select-Object Name
+          Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\Debuggers' -Recurse -Filter cdb.exe -ErrorAction SilentlyContinue | Select-Object FullName
+      - name: vcpkg install (default toolset)
+        if: matrix.toolset == 'default'
+        run: vcpkg install openssl:arm64-windows-static-md
+      - name: vcpkg install (pinned toolset)
+        if: matrix.toolset != 'default'
+        run: |
+          $dir = "$env:RUNNER_TEMP\triplets"
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          @"
+          set(VCPKG_TARGET_ARCHITECTURE arm64)
+          set(VCPKG_CRT_LINKAGE dynamic)
+          set(VCPKG_LIBRARY_LINKAGE static)
+          set(VCPKG_PLATFORM_TOOLSET v143)
+          set(VCPKG_PLATFORM_TOOLSET_VERSION ${{ matrix.toolset }})
+          "@ | Out-File -Encoding ascii "$dir\arm64-windows-static-md.cmake"
+          vcpkg install openssl:arm64-windows-static-md --overlay-triplets=$dir
+      - name: show OpenSSL build compiler
+        run: |
+          Get-ChildItem C:\vcpkg\buildtrees\openssl -Filter *.log | Select-Object Name
+          Select-String -Path C:\vcpkg\buildtrees\openssl\*-rel*.log -Pattern 'cl\.exe|Compiler|MSVC|CFLAGS|/O' -ErrorAction SilentlyContinue | Select-Object -First 30 | ForEach-Object { $_.Line }
+      - run: cargo generate-lockfile
+      - name: build test binary
+        run: |
+          cargo test -p openssl --lib --no-run
+          $exe = cargo test -p openssl --lib --no-run --message-format=json |
+            ForEach-Object { $_ | ConvertFrom-Json } |
+            Where-Object { $_.reason -eq 'compiler-artifact' -and $_.target.name -eq 'openssl' -and $_.profile.test } |
+            Select-Object -Last 1 -ExpandProperty executable
+          echo "TEST_EXE=$exe" | Out-File -FilePath $env:GITHUB_ENV -Append
+      - name: single-threaded run
+        continue-on-error: true
+        run: cargo test -p openssl --lib -- --test-threads=1 --nocapture
+      - name: one process per test
+        continue-on-error: true
+        run: |
+          $tests = & $env:TEST_EXE --list --format terse | Where-Object { $_ -match ': test$' } | ForEach-Object { $_ -replace ': test$', '' }
+          Write-Output "tests: $($tests.Count)"
+          $failed = @()
+          foreach ($t in $tests) {
+            & $env:TEST_EXE --exact $t --test-threads=1 *> $null
+            if ($LASTEXITCODE -ne 0) {
+              Write-Output ("FAILED {0} exit=0x{1:x8}" -f $t, $LASTEXITCODE)
+              $failed += $t
+            }
+          }
+          Write-Output "failed count: $($failed.Count)"
+          $failed -join "`n" | Out-File -Encoding ascii "$env:RUNNER_TEMP\failed.txt"
+          if ($failed.Count -ne 0) { exit 1 }
+      - name: debugger stacks for failing tests
+        if: always()
+        run: |
+          $list = "$env:RUNNER_TEMP\failed.txt"
+          if (!(Test-Path $list)) { exit 0 }
+          $cdb = Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\Debuggers\arm64' -Recurse -Filter cdb.exe -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName
+          if (!$cdb) { Write-Output "no cdb"; exit 0 }
+          $script = "$env:RUNNER_TEMP\cdb.txt"
+          @"
+          sxd eh
+          sxe -c ".echo ===EXCEPTION===; .exr -1; r; u @pc L4; ub @pc L12; .echo ===STACK===; kn 0x2000; .echo ===END===; q" av
+          sxe -c ".echo ===SOV===; kn 0x2000; q" sov
+          g
+          q
+          "@ | Out-File -Encoding ascii $script
+          foreach ($t in (Get-Content $list | Select-Object -First 5)) {
+            if (!$t) { continue }
+            Write-Output "##### $t"
+            $out = & $cdb -lines -cf $script $env:TEST_EXE --exact $t --test-threads=1 2>&1
+            $n = $out.Count
+            Write-Output "debugger output lines: $n"
+            if ($n -le 400) { $out } else { $out | Select-Object -First 250; Write-Output '...'; $out | Select-Object -Last 120 }
+          }
