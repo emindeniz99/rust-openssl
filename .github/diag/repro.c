@@ -58,7 +58,7 @@ int parse_one(CONN *s, size_t idx, int context, RAW *exts, void *x, size_t chain
                         cur->data.remaining, x, chainidx);
 }
 
-int parse_all(CONN *s, int context, RAW *exts, void *x, size_t chainidx, int fin)
+__declspec(noinline) int parse_all(CONN *s, int context, RAW *exts, void *x, size_t chainidx, int fin)
 {
     size_t i, n = 29;
     const DEF *d;
