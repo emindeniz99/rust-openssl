@@ -16,6 +16,35 @@ permissions:
   contents: read
 
 jobs:
+  repro:
+    name: minimal-repro
+    runs-on: windows-11-arm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: build and run repro.c with each toolset
+        run: |
+          $vcvars = "C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Auxiliary\Build\vcvarsall.bat"
+          $src = (Resolve-Path .github\diag\repro.c).Path
+          foreach ($v in '14.44', '14.51') {
+            foreach ($f in '/Gs0', '/Gs4096', '') {
+              $tag = "$v" + ($f -replace '/', '-')
+              $o = "$env:RUNNER_TEMP\repro-$tag"
+              @"
+          @call "$vcvars" arm64 -vcvars_ver=$v >nul || exit /b 1
+          cl /nologo /c /O2 $f /Fo$o.obj "$src" || exit /b 1
+          link /nologo /out:$o.exe $o.obj || exit /b 1
+          "@ | Out-File -Encoding ascii "$o.cmd"
+              Write-Output "===== MSVC $v flags: /O2 $f"
+              cmd /c "$o.cmd"
+              & "$o.exe"
+              Write-Output ("exit=0x{0:x8}" -f $LASTEXITCODE)
+              $bin = (Get-ChildItem "C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC" | Where-Object Name -like "$v*" | Select-Object -First 1).FullName + "\bin\Hostarm64\arm64\dumpbin.exe"
+              & .github/diag/scan.ps1 -Dumpbin $bin -Path "$o.obj" -Show parse_all, parse_one
+            }
+          }
+
   diag:
     strategy:
       fail-fast: false
@@ -44,17 +73,14 @@ jobs:
         run: vcpkg install openssl:arm64-windows-static-md
       - name: vcpkg install (pinned toolset)
         if: matrix.toolset != 'default'
+        run: vcpkg install openssl:arm64-windows-static-md --overlay-triplets=.github/vcpkg-triplets
+      - name: scan OpenSSL libs for __chkstk before lr save
         run: |
-          $dir = "$env:RUNNER_TEMP\triplets"
-          New-Item -ItemType Directory -Force $dir | Out-Null
-          @"
-          set(VCPKG_TARGET_ARCHITECTURE arm64)
-          set(VCPKG_CRT_LINKAGE dynamic)
-          set(VCPKG_LIBRARY_LINKAGE static)
-          set(VCPKG_PLATFORM_TOOLSET v143)
-          set(VCPKG_PLATFORM_TOOLSET_VERSION ${{ matrix.toolset }})
-          "@ | Out-File -Encoding ascii "$dir\arm64-windows-static-md.cmake"
-          vcpkg install openssl:arm64-windows-static-md --overlay-triplets=$dir
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
+          $bin = (Get-ChildItem "$vs\VC\Tools\MSVC" | Sort-Object Name | Select-Object -Last 1).FullName + "\bin\Hostarm64\arm64\dumpbin.exe"
+          foreach ($l in 'libssl', 'libcrypto') {
+            & .github/diag/scan.ps1 -Dumpbin $bin -Path "C:\vcpkg\installed\arm64-windows-static-md\lib\$l.lib" -Show tls_parse_all_extensions, evp_pkey_get_legacy
+          }
       - name: show OpenSSL build compiler
         run: |
           Get-ChildItem C:\vcpkg\buildtrees\openssl -Filter *.log | Select-Object Name
